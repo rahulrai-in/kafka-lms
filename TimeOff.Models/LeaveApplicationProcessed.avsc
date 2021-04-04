@@ -1,0 +1,31 @@
+﻿{
+  "namespace": "TimeOff.Models",
+  "type": "record",
+  "name": "LeaveApplicationProcessed",
+  "fields": [
+    {
+      "name": "EmpEmail",
+      "type": "string"
+    },
+    {
+      "name": "EmpDepartment",
+      "type": "string"
+    },
+    {
+      "name": "LeaveDurationInHours",
+      "type": "int"
+    },
+    {
+      "name": "LeaveStartDateTicks",
+      "type": "long"
+    },
+    {
+      "name": "ProcessedBy",
+      "type": "string"
+    },
+    {
+      "name": "Result",
+      "type": "string"
+    }
+  ]
+}
