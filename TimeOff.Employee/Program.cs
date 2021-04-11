@@ -1,7 +1,8 @@
 ﻿using System;
 using System.Globalization;
-using System.Net;
 using System.Threading.Tasks;
+using Azure.Data.SchemaRegistry;
+using Azure.Identity;
 using Confluent.Kafka;
 using Confluent.SchemaRegistry;
 using Confluent.SchemaRegistry.Serdes;
@@ -16,9 +17,11 @@ namespace TimeOff.Employee
         private static AdminClientConfig _adminConfig;
         private static SchemaRegistryConfig _schemaRegistryConfig;
         private static ProducerConfig _producerConfig;
+        private static ConfigReader _configReader;
+
         public static IConfiguration Configuration { get; private set; }
 
-        private static async Task Main(string[] args)
+        private static async Task Main()
         {
             Console.WriteLine("TimeOff Employee Terminal\n");
 
@@ -26,22 +29,51 @@ namespace TimeOff.Employee
                 .AddJsonFile("appsettings.json", true, true)
                 .Build();
 
-            // Read configs
-            _adminConfig = Configuration.GetSection(nameof(AdminClientConfig)).Get<AdminClientConfig>();
-            _schemaRegistryConfig = Configuration.GetSection(nameof(SchemaRegistryConfig)).Get<SchemaRegistryConfig>();
-            _producerConfig = Configuration.GetSection(nameof(ProducerConfig)).Get<ProducerConfig>();
-            _producerConfig.ClientId = Dns.GetHostName();
+            _configReader = new ConfigReader(Configuration);
 
-            await KafkaHelper.CreateTopicAsync(_adminConfig, ApplicationConstants.LeaveApplicationsTopicName, 3);
+            // Read configs
+            _schemaRegistryConfig = _configReader.GetSchemaRegistryConfig();
+            _producerConfig = _configReader.GetProducerConfig();
+
+            // Azure EH does not support Kafka Admin APIs.
+            if (_configReader.IsLocalEnvironment)
+            {
+                _adminConfig = _configReader.GetAdminConfig();
+                await KafkaHelper.CreateTopicAsync(_adminConfig, ApplicationConstants.LeaveApplicationsTopicName, 3);
+            }
+
             await AddMessagesAsync();
         }
 
+
         private static async Task AddMessagesAsync()
         {
-            using var schemaRegistry = new CachedSchemaRegistryClient(_schemaRegistryConfig);
+            CachedSchemaRegistryClient cachedSchemaRegistryClient = null;
+            KafkaAvroAsyncSerializer<string> kafkaAvroAsyncKeySerializer = null;
+            KafkaAvroAsyncSerializer<LeaveApplicationReceived> kafkaAvroAsyncValueSerializer = null;
+
+            if (_configReader.IsLocalEnvironment)
+            {
+                cachedSchemaRegistryClient = new CachedSchemaRegistryClient(_schemaRegistryConfig);
+            }
+            else
+            {
+                var schemaRegistryClientAz =
+                    new SchemaRegistryClient(Configuration["SchemaRegistryUrlAz"], new DefaultAzureCredential());
+                var schemaGroupName = Configuration["SchemaRegistryGroupNameAz"];
+                kafkaAvroAsyncKeySerializer =
+                    new KafkaAvroAsyncSerializer<string>(schemaRegistryClientAz, schemaGroupName);
+                kafkaAvroAsyncValueSerializer =
+                    new KafkaAvroAsyncSerializer<LeaveApplicationReceived>(schemaRegistryClientAz, schemaGroupName);
+            }
+
             using var producer = new ProducerBuilder<string, LeaveApplicationReceived>(_producerConfig)
-                .SetKeySerializer(new AvroSerializer<string>(schemaRegistry))
-                .SetValueSerializer(new AvroSerializer<LeaveApplicationReceived>(schemaRegistry))
+                .SetKeySerializer(_configReader.IsLocalEnvironment
+                    ? new AvroSerializer<string>(cachedSchemaRegistryClient)
+                    : kafkaAvroAsyncKeySerializer)
+                .SetValueSerializer(_configReader.IsLocalEnvironment
+                    ? new AvroSerializer<LeaveApplicationReceived>(cachedSchemaRegistryClient)
+                    : kafkaAvroAsyncValueSerializer)
                 .Build();
             while (true)
             {
@@ -51,7 +83,7 @@ namespace TimeOff.Employee
                 var leaveDurationInHours =
                     int.Parse(ReadLine.Read("Enter number of hours of leave requested (e.g. 8): ", "8"));
                 var leaveStartDate = DateTime.ParseExact(ReadLine.Read("Enter vacation start date (dd-mm-yy): ",
-                    $"{DateTime.Today:dd-MM-yy}"), "dd-mm-yy", CultureInfo.InvariantCulture);
+                    $"{DateTime.Today:dd-mm-yy}"), "dd-mm-yy", CultureInfo.InvariantCulture);
 
                 var leaveApplication = new LeaveApplicationReceived
                 {

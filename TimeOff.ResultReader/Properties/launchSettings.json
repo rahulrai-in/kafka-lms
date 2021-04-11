@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "TimeOff.ResultReader": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "AZURE_CLIENT_SECRET": "CLIENT SECRET",
+        "AZURE_CLIENT_ID": "CLIENT ID",
+        "AZURE_TENANT_ID": "TENANT ID"
+      }
+    }
+  }
+}

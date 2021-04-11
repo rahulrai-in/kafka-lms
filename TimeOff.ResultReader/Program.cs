@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Text.Json;
+using Azure.Data.SchemaRegistry;
+using Azure.Identity;
 using Confluent.Kafka;
 using Confluent.Kafka.SyncOverAsync;
 using Confluent.SchemaRegistry;
@@ -12,24 +14,45 @@ namespace TimeOff.ResultReader
 {
     internal class Program
     {
-        private static void Main(string[] args)
+        private static void Main()
         {
+            CachedSchemaRegistryClient cachedSchemaRegistryClient = null;
+            KafkaAvroDeserializer<string> kafkaAvroKeyDeserializer = null;
+            KafkaAvroDeserializer<LeaveApplicationProcessed> kafkaAvroValueDeserializer = null;
+
             Console.WriteLine("TimeOff Results Terminal\n");
 
             var configuration = new ConfigurationBuilder()
                 .AddJsonFile("appsettings.json", true, true)
                 .Build();
 
-            var schemaRegistryConfig =
-                configuration.GetSection(nameof(SchemaRegistryConfig)).Get<SchemaRegistryConfig>();
-            var consumerConfig = configuration.GetSection(nameof(ConsumerConfig)).Get<ConsumerConfig>();
-            // Read messages from start if no commit exists.
-            consumerConfig.AutoOffsetReset = AutoOffsetReset.Earliest;
+            var configReader = new ConfigReader(configuration);
 
-            using var schemaRegistry = new CachedSchemaRegistryClient(schemaRegistryConfig);
+            var schemaRegistryConfig = configReader.GetSchemaRegistryConfig();
+            var consumerConfig = configReader.GetConsumerConfig();
+
+            if (configReader.IsLocalEnvironment)
+            {
+                cachedSchemaRegistryClient = new CachedSchemaRegistryClient(schemaRegistryConfig);
+            }
+            else
+            {
+                var schemaRegistryClientAz =
+                    new SchemaRegistryClient(configuration["SchemaRegistryUrlAz"], new DefaultAzureCredential());
+                var schemaGroupName = configuration["SchemaRegistryGroupNameAz"];
+                kafkaAvroKeyDeserializer =
+                    new KafkaAvroDeserializer<string>(schemaRegistryClientAz, schemaGroupName);
+                kafkaAvroValueDeserializer =
+                    new KafkaAvroDeserializer<LeaveApplicationProcessed>(schemaRegistryClientAz, schemaGroupName);
+            }
+
             using var consumer = new ConsumerBuilder<string, LeaveApplicationProcessed>(consumerConfig)
-                .SetKeyDeserializer(new AvroDeserializer<string>(schemaRegistry).AsSyncOverAsync())
-                .SetValueDeserializer(new AvroDeserializer<LeaveApplicationProcessed>(schemaRegistry).AsSyncOverAsync())
+                .SetKeyDeserializer(configReader.IsLocalEnvironment
+                    ? new AvroDeserializer<string>(cachedSchemaRegistryClient).AsSyncOverAsync()
+                    : kafkaAvroKeyDeserializer)
+                .SetValueDeserializer(configReader.IsLocalEnvironment
+                    ? new AvroDeserializer<LeaveApplicationProcessed>(cachedSchemaRegistryClient).AsSyncOverAsync()
+                    : kafkaAvroValueDeserializer)
                 .SetErrorHandler((_, e) => Console.WriteLine($"Error: {e.Reason}"))
                 .Build();
             {

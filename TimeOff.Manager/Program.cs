@@ -1,10 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Net;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Azure.Data.SchemaRegistry;
+using Azure.Identity;
 using Confluent.Kafka;
 using Confluent.Kafka.SyncOverAsync;
 using Confluent.SchemaRegistry;
@@ -19,6 +20,7 @@ namespace TimeOff.Manager
 
     internal class Program
     {
+        private static ConfigReader _configReader;
         private static AdminClientConfig _adminConfig;
         private static SchemaRegistryConfig _schemaRegistryConfig;
         private static ConsumerConfig _consumerConfig;
@@ -28,7 +30,7 @@ namespace TimeOff.Manager
 
         public static IConfiguration Configuration { get; private set; }
 
-        private static async Task Main(string[] args)
+        private static async Task Main()
         {
             Console.WriteLine("TimeOff Manager Terminal\n");
 
@@ -36,15 +38,21 @@ namespace TimeOff.Manager
                 .AddJsonFile("appsettings.json", true, true)
                 .Build();
 
-            _adminConfig = Configuration.GetSection(nameof(AdminClientConfig)).Get<AdminClientConfig>();
-            _schemaRegistryConfig = Configuration.GetSection(nameof(SchemaRegistryConfig)).Get<SchemaRegistryConfig>();
-            _consumerConfig = Configuration.GetSection(nameof(ConsumerConfig)).Get<ConsumerConfig>();
-            // Read messages from start if no commit exists.
-            _consumerConfig.AutoOffsetReset = AutoOffsetReset.Earliest;
-            _producerConfig = Configuration.GetSection(nameof(ProducerConfig)).Get<ProducerConfig>();
-            _producerConfig.ClientId = Dns.GetHostName();
+            _configReader = new ConfigReader(Configuration);
 
-            await KafkaHelper.CreateTopicAsync(_adminConfig, ApplicationConstants.LeaveApplicationResultsTopicName, 1);
+            // Read configs
+            _schemaRegistryConfig = _configReader.GetSchemaRegistryConfig();
+            _consumerConfig = _configReader.GetConsumerConfig();
+            _producerConfig = _configReader.GetProducerConfig();
+
+            // Azure EH does not support Kafka Admin APIs.
+            if (_configReader.IsLocalEnvironment)
+            {
+                _adminConfig = _configReader.GetAdminConfig();
+                await KafkaHelper.CreateTopicAsync(_adminConfig, ApplicationConstants.LeaveApplicationResultsTopicName,
+                    1);
+            }
+
             _leaveApplicationReceivedMessages = new Queue<KafkaMessage>();
             await Task.WhenAny(Task.Run(StartManagerConsumer), Task.Run(StartLeaveApplicationProcessor));
         }
@@ -64,18 +72,43 @@ namespace TimeOff.Manager
                     $"Received message: {key} from partition: {partition} Value: {JsonSerializer.Serialize(leaveApplication)}");
 
                 // Make decision on leave request.
-                var isApproved = ReadLine.Read("Approve request? (Y/N): ", "Y").Equals("Y", StringComparison.OrdinalIgnoreCase);
+                var isApproved = ReadLine.Read("Approve request? (Y/N): ", "Y")
+                    .Equals("Y", StringComparison.OrdinalIgnoreCase);
                 await SendMessageToResultTopicAsync(leaveApplication, isApproved, partition);
             }
+
             // ReSharper disable once FunctionNeverReturns
         }
 
         private static Task StartManagerConsumer()
         {
-            using var schemaRegistry = new CachedSchemaRegistryClient(_schemaRegistryConfig);
+            CachedSchemaRegistryClient cachedSchemaRegistryClient = null;
+            KafkaAvroDeserializer<string> kafkaAvroKeyDeserializer = null;
+            KafkaAvroDeserializer<LeaveApplicationReceived> kafkaAvroValueDeserializer = null;
+
+            if (_configReader.IsLocalEnvironment)
+            {
+                cachedSchemaRegistryClient = new CachedSchemaRegistryClient(_schemaRegistryConfig);
+            }
+            else
+            {
+                var schemaRegistryClientAz =
+                    new SchemaRegistryClient(Configuration["SchemaRegistryUrlAz"], new DefaultAzureCredential());
+                var schemaGroupName = Configuration["SchemaRegistryGroupNameAz"];
+                kafkaAvroKeyDeserializer =
+                    new KafkaAvroDeserializer<string>(schemaRegistryClientAz, schemaGroupName);
+                kafkaAvroValueDeserializer =
+                    new KafkaAvroDeserializer<LeaveApplicationReceived>(schemaRegistryClientAz, schemaGroupName);
+            }
+
             using var consumer = new ConsumerBuilder<string, LeaveApplicationReceived>(_consumerConfig)
-                .SetKeyDeserializer(new AvroDeserializer<string>(schemaRegistry).AsSyncOverAsync())
-                .SetValueDeserializer(new AvroDeserializer<LeaveApplicationReceived>(schemaRegistry).AsSyncOverAsync())
+                .SetKeyDeserializer(
+                    _configReader.IsLocalEnvironment
+                        ? new AvroDeserializer<string>(cachedSchemaRegistryClient).AsSyncOverAsync()
+                        : kafkaAvroKeyDeserializer)
+                .SetValueDeserializer(_configReader.IsLocalEnvironment
+                    ? new AvroDeserializer<LeaveApplicationReceived>(cachedSchemaRegistryClient).AsSyncOverAsync()
+                    : kafkaAvroValueDeserializer)
                 .SetErrorHandler((_, e) => Console.WriteLine($"Error: {e.Reason}"))
                 .Build();
             {
@@ -121,10 +154,32 @@ namespace TimeOff.Manager
             int partitionId
         )
         {
-            using var schemaRegistry = new CachedSchemaRegistryClient(_schemaRegistryConfig);
+            CachedSchemaRegistryClient cachedSchemaRegistryClient = null;
+            KafkaAvroAsyncSerializer<string> kafkaAvroAsyncKeySerializer = null;
+            KafkaAvroAsyncSerializer<LeaveApplicationProcessed> kafkaAvroAsyncValueSerializer = null;
+
+            if (_configReader.IsLocalEnvironment)
+            {
+                cachedSchemaRegistryClient = new CachedSchemaRegistryClient(_schemaRegistryConfig);
+            }
+            else
+            {
+                var schemaRegistryClientAz =
+                    new SchemaRegistryClient(Configuration["SchemaRegistryUrlAz"], new DefaultAzureCredential());
+                var schemaGroupName = Configuration["SchemaRegistryGroupNameAz"];
+                kafkaAvroAsyncKeySerializer =
+                    new KafkaAvroAsyncSerializer<string>(schemaRegistryClientAz, schemaGroupName);
+                kafkaAvroAsyncValueSerializer =
+                    new KafkaAvroAsyncSerializer<LeaveApplicationProcessed>(schemaRegistryClientAz, schemaGroupName);
+            }
+
             using var producer = new ProducerBuilder<string, LeaveApplicationProcessed>(_producerConfig)
-                .SetKeySerializer(new AvroSerializer<string>(schemaRegistry))
-                .SetValueSerializer(new AvroSerializer<LeaveApplicationProcessed>(schemaRegistry))
+                .SetKeySerializer(_configReader.IsLocalEnvironment
+                    ? new AvroSerializer<string>(cachedSchemaRegistryClient)
+                    : kafkaAvroAsyncKeySerializer)
+                .SetValueSerializer(_configReader.IsLocalEnvironment
+                    ? new AvroSerializer<LeaveApplicationProcessed>(cachedSchemaRegistryClient)
+                    : kafkaAvroAsyncValueSerializer)
                 .Build();
             {
                 var leaveApplicationResult = new LeaveApplicationProcessed
